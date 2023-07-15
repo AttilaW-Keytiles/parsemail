@@ -1,3 +1,3 @@
-module github.com/DusanKasan/parsemail
+module github.com/AttilaW-Keytiles/parsemail
 
 go 1.12
