@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/mail"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ const contentTypeMultipartAlternative = "multipart/alternative"
 const contentTypeMultipartRelated = "multipart/related"
 const contentTypeTextHtml = "text/html"
 const contentTypeTextPlain = "text/plain"
+const contentTypeOctetStream = "application/octet-stream"
 
 // Parse an email message read from io.Reader into parsemail.Email struct
 func Parse(r io.Reader) (email Email, err error) {
@@ -45,11 +47,16 @@ func Parse(r io.Reader) (email Email, err error) {
 	case contentTypeMultipartRelated:
 		email.TextBody, email.HTMLBody, email.EmbeddedFiles, err = parseMultipartRelated(msg.Body, params["boundary"])
 	case contentTypeTextPlain:
+		msg.Body, _ = decodeContent(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
 		message, _ := ioutil.ReadAll(msg.Body)
 		email.TextBody = strings.TrimSuffix(string(message[:]), "\n")
 	case contentTypeTextHtml:
+		msg.Body, _ = decodeContent(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
 		message, _ := ioutil.ReadAll(msg.Body)
 		email.HTMLBody = strings.TrimSuffix(string(message[:]), "\n")
+	// came from https://github.com/DusanKasan/parsemail/pull/29
+	case contentTypeOctetStream:
+		email.Attachments, err = parseAttachmentOnlyEmail(msg.Body, msg.Header)
 	default:
 		email.Content, err = decodeContent(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
 	}
@@ -103,10 +110,38 @@ func parseContentType(contentTypeHeader string) (contentType string, params map[
 	return mime.ParseMediaType(contentTypeHeader)
 }
 
+// came from https://github.com/DusanKasan/parsemail/pull/29
+func parseAttachmentOnlyEmail(body io.Reader, header mail.Header) (attachments []Attachment, err error) {
+	contentDisposition := header.Get("Content-Disposition")
+
+	if len(contentDisposition) > 0 && strings.Contains(contentDisposition, "attachment;") {
+
+		attachmentData, err := decodeContent(body, header.Get("Content-Transfer-Encoding"))
+		if err != nil {
+			return attachments, err
+		}
+
+		fileName := strings.Replace(contentDisposition, "attachment; filename=\"", "", -1)
+		fileName = strings.TrimRight(fileName, "\"")
+
+		at := Attachment{
+			Filename:    fileName,
+			ContentType: "application/octet-stream",
+			Data:        attachmentData,
+		}
+
+		attachments = append(attachments, at)
+	}
+
+	return attachments, nil
+}
+
 func parseMultipartRelated(msg io.Reader, boundary string) (textBody, htmlBody string, embeddedFiles []EmbeddedFile, err error) {
 	pmr := multipart.NewReader(msg, boundary)
 	for {
-		part, err := pmr.NextPart()
+		// from https://github.com/DusanKasan/parsemail/pull/38
+		//part, err := pmr.NextPart()
+		part, err := pmr.NextRawPart()
 
 		if err == io.EOF {
 			break
@@ -163,7 +198,9 @@ func parseMultipartRelated(msg io.Reader, boundary string) (textBody, htmlBody s
 func parseMultipartAlternative(msg io.Reader, boundary string) (textBody, htmlBody string, embeddedFiles []EmbeddedFile, err error) {
 	pmr := multipart.NewReader(msg, boundary)
 	for {
-		part, err := pmr.NextPart()
+		// from https://github.com/DusanKasan/parsemail/pull/38
+		//part, err := pmr.NextPart()
+		part, err := pmr.NextRawPart()
 
 		if err == io.EOF {
 			break
@@ -220,7 +257,9 @@ func parseMultipartAlternative(msg io.Reader, boundary string) (textBody, htmlBo
 func parseMultipartMixed(msg io.Reader, boundary string) (textBody, htmlBody string, attachments []Attachment, embeddedFiles []EmbeddedFile, err error) {
 	mr := multipart.NewReader(msg, boundary)
 	for {
-		part, err := mr.NextPart()
+		// from https://github.com/DusanKasan/parsemail/pull/38
+		//part, err := mr.NextPart()
+		part, err := mr.NextRawPart()
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -345,7 +384,7 @@ func decodeAttachment(part *multipart.Part) (at Attachment, err error) {
 }
 
 func decodeContent(content io.Reader, encoding string) (io.Reader, error) {
-	switch encoding {
+	switch strings.ToLower(encoding) {
 	case "base64":
 		decoded := base64.NewDecoder(base64.StdEncoding, content)
 		b, err := ioutil.ReadAll(decoded)
@@ -361,6 +400,8 @@ func decodeContent(content io.Reader, encoding string) (io.Reader, error) {
 		}
 
 		return bytes.NewReader(dd), nil
+	case "quoted-printable":
+		return quotedprintable.NewReader(content), nil
 	case "":
 		return content, nil
 	default:
